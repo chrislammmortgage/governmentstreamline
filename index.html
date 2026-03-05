@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Team Lamm Refi Calculator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'JetBrains Mono','SF Mono',monospace;background:#0a0e17;color:#c8cdd5;min-height:100vh}
+  input,select,button,textarea{font-family:inherit}
+  ::selection{background:#50fa7b33}
+  ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#0a0e17}::-webkit-scrollbar-thumb{background:#2a3040;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useCallback} = React;
+const BRANCH_FEES={processing:499,underwriting:499,credit_report:277,flood_cert:5,tax_service:65,recording:375,appraisal:750};
+const TIERS=[[250000,430,605],[500000,550,685],[750000,680,785],[1000000,760,925],[1500000,1045,1085],[2000000,1330,1085],[3000000,2035,1085],[4000000,2740,1085],[5000000,3620,1085],[6000000,4120,1085]];
+function tLookup(a){for(const[m,p,e]of TIERS)if(a<=m)return{l:p,s:e,t:p+e,tier:"Up to $"+m.toLocaleString()};return{l:4120,s:1085,t:5205,tier:"Over $6M"};}
+function mp(p,r,n){if(!r)return Math.round(p/n*100)/100;const m=r/12;return Math.round(p*(m*Math.pow(1+m,n))/(Math.pow(1+m,n)-1)*100)/100;}
+function pd(b,r){return Math.round(b*r/365*100)/100;}
+function fmt(n){if(n==null||isNaN(n))return"$0";return(n<0?"-":"")+"$"+Math.abs(Math.round(n)).toLocaleString();}
+function fmtC(n){if(n==null||isNaN(n))return"$0.00";return(n<0?"-":"")+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});}
+function fmtP(r,d=3){return(r*100).toFixed(d)+"%";}
+
+// FHA Seasoning: 210 days from CLOSING DATE + 6 payments
+function fhaSeason(oc,fp,tc){
+  if(!oc||!fp||!tc)return null;
+  const o=new Date(oc),f=new Date(fp),t=new Date(tc);
+  const days=Math.floor((t-o)/864e5);
+  const mos=(t.getFullYear()-f.getFullYear())*12+(t.getMonth()-f.getMonth());
+  const d210=new Date(o);d210.setDate(d210.getDate()+210);
+  const m6=new Date(f);m6.setMonth(m6.getMonth()+6);
+  const earliest=d210>m6?d210:m6;
+  return{days,daysPass:days>=210,mos,mosPass:mos>=6,pmts:Math.max(0,mos),pmtsPass:mos>=6,earliest:earliest.toISOString().split("T")[0],pass:days>=210&&mos>=6};
+}
+// VA IRRRL Seasoning: 210 days from FIRST PAYMENT DUE DATE + 6 consecutive payments (PL 116-33)
+function vaSeason(fp,tc,pmts){
+  if(!fp||!tc)return null;
+  const f=new Date(fp),t=new Date(tc);
+  const days=Math.floor((t-f)/864e5);
+  const d210=new Date(f);d210.setDate(d210.getDate()+210);
+  return{days,daysPass:days>=210,pmts,pmtsPass:pmts>=6,earliest:d210.toISOString().split("T")[0],pass:days>=210&&pmts>=6};
+}
+// Payoff: 20-day buffer past target closing
+function estPayoff(bal,rate,stDate,tcDate){
+  if(!stDate||!tcDate)return{payoff:bal,days:0,pd:0};
+  const days=Math.max(0,Math.floor((new Date(tcDate)-new Date(stDate))/864e5))+20;
+  const d=pd(bal,rate);
+  return{payoff:Math.round((bal+d*days)*100)/100,days,pd:d};
+}
+function estEscrowRefund(bal,mo,stDate,tcDate){
+  if(!bal||!stDate||!tcDate)return null;
+  const mos=Math.max(0,Math.ceil((new Date(tcDate)-new Date(stDate))/(864e5*30)));
+  return{bal,mos,deps:Math.round(mo*mos),refund:Math.round(bal+mo*mos)};
+}
+function calcSkipped(tcDate,totalPmt){
+  if(!tcDate)return null;
+  const tc=new Date(tcDate);
+  const fp=new Date(tc.getFullYear(),tc.getMonth()+2,1);
+  const last=new Date(tc.getFullYear(),tc.getMonth(),1);
+  const cnt=(fp.getFullYear()-last.getFullYear())*12+(fp.getMonth()-last.getMonth())-1;
+  const months=[];
+  for(let i=1;i<=cnt;i++){const m=new Date(last);m.setMonth(m.getMonth()+i);months.push(m.toLocaleString("default",{month:"long",year:"numeric"}));}
+  return{cnt:Math.max(0,cnt),months,saved:Math.round(totalPmt*Math.max(0,cnt)),firstNew:fp.toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})};
+}
+// UFMIP Refund — linear interpolation between FHA data points
+// M1=80%, M6=70%, M12=58%, M24=34%, M30=22%, M36=10%, >36=0%
+const UFMIP_PTS=[[1,.80],[6,.70],[12,.58],[24,.34],[30,.22],[36,.10]];
+function ufmipRefund(orig,caseDate,closeDate){
+  const ms=(new Date(closeDate).getFullYear()-new Date(caseDate).getFullYear())*12+(new Date(closeDate).getMonth()-new Date(caseDate).getMonth());
+  let p=0;
+  if(ms<=0)p=.80;
+  else if(ms>36)p=0;
+  else{for(let i=0;i<UFMIP_PTS.length-1;i++){const[m1,p1]=UFMIP_PTS[i],[m2,p2]=UFMIP_PTS[i+1];if(ms>=m1&&ms<=m2){p=p1+(p2-p1)*(ms-m1)/(m2-m1);break;}}}
+  p=Math.round(p*10000)/10000;
+  return{ms,p,pDisp:(p*100).toFixed(1)+"%",amt:Math.round(orig*p*100)/100};
+}
+function newUfmip(base,ref=0){const g=Math.round(base*.0175),n=Math.round(g-ref);return{base,g,ref,n,total:Math.round(base+n)};}
+function mipRate(term,ltv){if(term>180)return ltv>90?.0055:.005;return ltv>90?.004:.0015;}
+function moMip(base,rate){return Math.round(base*rate/12);}
+function va8923(bal,costs,discPct,ffRate){
+  const l3=bal,l4=Math.round(l3*discPct/100*100)/100,l5=Math.round(l3*ffRate*100)/100;
+  const l7=l4+l5,l9=l3+l7+costs;
+  const l11=Math.round(l9*discPct/100*100)/100,l14=Math.round((l9+l11)*ffRate*100)/100;
+  return{bal,costs,initFF:l5,prelim:l9,revFF:l14,maxLoan:Math.floor(l9+l11+l14-l7+costs)};
+}
+// Pricing: OB Price + Price Exception = Adjusted. >100=credit, <100=points
+function calcPricing(obP,pe,loanAmt){
+  const adj=Math.round((obP+pe)*1000)/1000,dp=adj-100;
+  const dd=Math.round(loanAmt*dp/100*100)/100;
+  return{obPrice:obP,priceException:pe,adjusted:adj,diffPct:dp,diffDollars:Math.abs(dd),isCredit:dd>0};
+}
+
+function runFHA(i){
+  const po=i.useSt?estPayoff(i.stBal||i.bal,i.rate,i.stDate,i.tcDate):{payoff:i.bal+pd(i.bal,i.rate)*i.dtc,days:i.dtc,pd:pd(i.bal,i.rate)};
+  const payoff=Math.round(po.payoff*100)/100;
+  const ref=ufmipRefund(i.origUfmip,i.caseDate,i.tcDate);
+  const u=newUfmip(payoff,ref.amt);
+  const tl=u.total,bl=u.base;
+  const mr=mipRate(i.term,95),nm=moMip(bl,mr);
+  const npd=pd(tl,i.nr);
+  const mT=Math.round(i.tax/12*100)/100,mI=Math.round(i.ins/12*100)/100,esc=Math.round((mT+mI)*100)/100;
+  const gI=Math.round(mI*i.eIM),gT=Math.round(mT*i.eTM);
+  const fT=Math.round(mT*i.pTM),fI=Math.round(mI*i.iPM);
+  const tl2=tLookup(tl);
+  const pricing=calcPricing(i.obP,i.pe,payoff);
+  const sA={"Processing Fees":499,"Underwriting Fees":499};
+  if(!pricing.isCredit&&pricing.diffDollars>0)sA["Discount Points ("+Math.abs(pricing.diffPct).toFixed(3)+"%)"]=Math.round(pricing.diffDollars);
+  const tA=Object.values(sA).reduce((a,b)=>a+b,0);
+  const sB={"Credit Report":277,"Flood Certification":5,"Tax Service":65,"UFMIP (Net Financed)":u.n},tB=Object.values(sB).reduce((a,b)=>a+b,0);
+  const sC={"Title — Lender's Policy":tl2.l,"Title — Settlement/Escrow":tl2.s},tC=tl2.t;
+  const tD=tA+tB+tC;
+  const sE={"Recording Fees (incl CA SB2)":375},tE=375;
+  const sF={};if(npd>0)sF["Prepaid Interest ("+fmtC(npd)+"/day x 1 day)"]=Math.round(npd);
+  if(fT>0)sF["Prepaid Property Tax ("+fmtC(mT)+"/mo x "+i.pTM+" mo)"]=fT;
+  if(fI>0)sF["Prepaid Insurance ("+fmtC(mI)+"/mo x "+i.iPM+" mo)"]=fI;
+  const tF=Object.values(sF).reduce((a,b)=>a+b,0);
+  const sG={};if(gI>0)sG["Insurance Reserve ("+fmtC(mI)+"/mo x "+i.eIM+" mo)"]=gI;
+  if(gT>0)sG["Tax Reserve ("+fmtC(mT)+"/mo x "+i.eTM+" mo)"]=gT;
+  const tG=Object.values(sG).reduce((a,b)=>a+b,0),tI2=tE+tF+tG;
+  const lc=pricing.isCredit?Math.round(pricing.diffDollars):0;
+  const tJ=tD+tI2-lc,fo=tD+tE-lc;
+  const ctc=tl-tJ-payoff;
+  const npi=mp(tl,i.nr,i.term);
+  const newT=Math.round((npi+nm+esc)*100)/100,oldT=Math.round((i.pi+i.mip+esc)*100)/100;
+  const sav=Math.round((oldT-newT)*100)/100;
+  const omr=i.bal>0?(i.mip*12)/i.bal:0;
+  const rr=(i.rate+omr)-(i.nr+mr),pr=(i.pi+i.mip)-(npi+nm);
+  const seas=fhaSeason(i.ocDate,i.fpDate,i.tcDate);
+  const eRef=estEscrowRefund(i.eBal,i.eMo||esc,i.stDate,i.tcDate);
+  const skip=calcSkipped(i.tcDate,i.pi+i.mip+(i.eMo||esc));
+  const be=sav>0?Math.round(Math.max(fo,0)/sav*10)/10:null;
+  return{payoff,po,ref,u,tl,bl,mr,nm,npd,tl2,sA,tA,sB,tB,sC,tC,tD,sE,tE,sF,tF,sG,tG,tI2,tJ,fo,pricing,lc,ctc,npi,newT,oldT,sav,annual:Math.round(sav*12*100)/100,rr,pr,rPass:rr>=.005,pPass:pr>=50,ntbPass:rr>=.005||pr>=50,seas,eRef,skip,be,mT,mI,esc,nr:i.nr,term:i.term};
+}
+
+function runVA(i){
+  const po=i.useSt?estPayoff(i.stBal||i.bal,i.rate,i.stDate,i.tcDate):{payoff:i.bal+pd(i.bal,i.rate)*i.dtc,days:i.dtc,pd:pd(i.bal,i.rate)};
+  const payoff=Math.round(po.payoff*100)/100;
+  const ffR=i.disEx?0:.005;
+  const mT=Math.round(i.tax/12*100)/100,mI=Math.round(i.ins/12*100)/100,esc=Math.round((mT+mI)*100)/100;
+  const gI=Math.round(mI*i.eIM),gT=Math.round(mT*i.eTM);
+  const fT=Math.round(mT*i.pTM),fI=Math.round(mI*i.iPM);
+  const tl2=tLookup(payoff);
+  const pricing=calcPricing(i.obP,i.pe,payoff);
+  const discPts=(!pricing.isCredit&&pricing.diffDollars>0)?Math.round(pricing.diffDollars):0;
+  const costsExFF=998+discPts+277+5+65+tl2.t+375;
+  const va=va8923(payoff,costsExFF,i.pts||0,ffR);
+  const totalLoan=va.maxLoan;
+  const ffAmt=Math.round(totalLoan*ffR*100)/100;
+  const npd=pd(totalLoan,i.nr);
+  const sA={"Processing Fees":499,"Underwriting Fees":499};
+  if(discPts>0)sA["Discount Points ("+Math.abs(pricing.diffPct).toFixed(3)+"%)"]=discPts;
+  const tA=Object.values(sA).reduce((a,b)=>a+b,0);
+  const sB={"Credit Report":277,"Flood Certification":5,"Tax Service":65};
+  if(ffAmt>0)sB["VA Funding Fee"]=ffAmt;
+  const tB=Object.values(sB).reduce((a,b)=>a+b,0);
+  const sC={"Title — Lender's Policy":tl2.l,"Title — Settlement/Escrow":tl2.s},tC=tl2.t;
+  const tD=tA+tB+tC;
+  const sE={"Recording Fees (incl CA SB2)":375},tE=375;
+  const sF={};if(npd>0)sF["Prepaid Interest ("+fmtC(npd)+"/day x 1 day)"]=Math.round(npd);
+  if(fT>0)sF["Prepaid Property Tax ("+fmtC(mT)+"/mo x "+i.pTM+" mo)"]=fT;
+  if(fI>0)sF["Prepaid Insurance ("+fmtC(mI)+"/mo x "+i.iPM+" mo)"]=fI;
+  const tF=Object.values(sF).reduce((a,b)=>a+b,0);
+  const sG={};if(gI>0)sG["Insurance Reserve ("+fmtC(mI)+"/mo x "+i.eIM+" mo)"]=gI;
+  if(gT>0)sG["Tax Reserve ("+fmtC(mT)+"/mo x "+i.eTM+" mo)"]=gT;
+  const tG=Object.values(sG).reduce((a,b)=>a+b,0),tI2=tE+tF+tG;
+  const lc=pricing.isCredit?Math.round(pricing.diffDollars):0;
+  const tJ=tD+tI2-lc,refiC=costsExFF+ffAmt-lc;
+  const ctc=totalLoan-tJ-payoff;
+  const npi=mp(totalLoan,i.nr,i.term);
+  const newT=Math.round((npi+esc)*100)/100,oldT=Math.round((i.pi+esc)*100)/100;
+  const sav=Math.round((oldT-newT)*100)/100;
+  const rr=i.rate-i.nr;
+  const recM=sav>0?Math.round(Math.max(refiC,0)/sav*10)/10:null;
+  const seas=vaSeason(i.fpDate,i.tcDate,i.pmts||0);
+  const eRef=estEscrowRefund(i.eBal,i.eMo||esc,i.stDate,i.tcDate);
+  const skip=calcSkipped(i.tcDate,i.pi+(i.eMo||esc));
+  return{payoff,po,va,totalLoan,ffR,ffAmt,disEx:i.disEx,tl2,sA,tA,sB,tB,sC,tC,tD,sE,tE,sF,tF,sG,tG,tI2,tJ,refiC,pricing,lc,ctc,npi,newT,oldT,sav,annual:Math.round(sav*12*100)/100,rr,ntbPass:rr>=.005,recM,recPass:recM!==null&&recM<=36,seas,eRef,skip,be:recM,mT,mI,esc,nr:i.nr,term:i.term};
+}
+
+function generatePDF(r,tab,borrower,property,lo){
+  const{jsPDF}=window.jspdf;const doc=new jsPDF();let y=20;const LM=15,RV=145;
+  const hdr=(t)=>{doc.setFontSize(9);doc.setTextColor(80,250,123);doc.text(t,LM,y);y+=6;doc.setDrawColor(30,41,59);doc.line(LM,y-2,195,y-2);};
+  const row=(l,v,bold)=>{doc.setFontSize(8);doc.setTextColor(bold?226:139,bold?232:141,bold?240:165);doc.text(l,LM+2,y);doc.text(String(v),RV,y,{align:"right"});y+=5;};
+  const divider=()=>{doc.setDrawColor(30,41,59);doc.line(LM,y,195,y);y+=4;};
+  const np=()=>{if(y>260){doc.addPage();y=20;}};
+  doc.setFillColor(10,14,23);doc.rect(0,0,210,297,"F");
+  doc.setFontSize(12);doc.setTextColor(80,250,123);doc.text("TEAM LAMM — PROCESSING WORKSHEET",LM,y);y+=6;
+  doc.setFontSize(7);doc.setTextColor(98,114,164);doc.text("MortgageOne Inc. NMLS #209221 · Internal Use Only · "+new Date().toLocaleDateString(),LM,y);y+=10;
+  hdr("LOAN INFORMATION");
+  row("Borrower",borrower||"TBD");row("Property",property||"TBD");
+  row("Loan Officer",lo||"Team Lamm");row("Loan Type",tab==="fha"?"FHA Streamline":"VA IRRRL");
+  row("Date Prepared",new Date().toLocaleDateString());y+=4;
+  hdr("PAYOFF (20-DAY BUFFER)");
+  row("Estimated Payoff",fmt(r.payoff));row("Per Diem Interest",fmtC(r.po?.pd||0)+"/day");
+  row("Payoff Days (incl 20-day buffer)",(r.po?.days||0)+" days");y+=4;
+  if(tab==="fha"&&r.u){hdr("UFMIP");row("Months Since Case",String(r.ref?.ms||0));row("Refund Rate",r.ref?.pDisp||"0%");
+  row("Refund Amount",fmt(r.ref?.amt||0));row("Gross UFMIP (1.75%)",fmt(r.u.g));row("Net UFMIP Financed",fmt(r.u.n));row("Total Loan Amount",fmt(r.tl),true);y+=4;}
+  if(tab==="va"&&r.va){hdr("VA FORM 26-8923");row("Existing Balance",fmt(r.va.bal));row("Closing Costs (excl FF)",fmt(r.va.costs));
+  row("Preliminary Loan",fmt(r.va.prelim));row("Revised FF",fmt(r.va.revFF));row("Max Loan Amount",fmt(r.va.maxLoan),true);
+  row("Funding Fee ("+(r.disEx?"EXEMPT":"0.50%")+")",fmt(r.ffAmt));y+=4;}
+  np();hdr("CLOSING COSTS — LE SECTIONS A-J");
+  const sp=(label,items,total)=>{doc.setFontSize(7);doc.setTextColor(139,233,253);doc.text(label,LM+2,y);doc.text(fmt(total),RV,y,{align:"right"});y+=5;Object.entries(items).forEach(([k,v])=>row("  "+k,fmt(v)));};
+  sp("A. ORIGINATION CHARGES",r.sA,r.tA);sp("B. SERVICES CANNOT SHOP FOR",r.sB,r.tB);sp("C. SERVICES CAN SHOP FOR",r.sC,r.tC);
+  divider();row("D. TOTAL LOAN COSTS (A+B+C)",fmt(r.tD),true);y+=2;np();
+  sp("E. GOVERNMENT FEES",r.sE,r.tE);
+  if(Object.keys(r.sF).length)sp("F. PREPAIDS",r.sF,r.tF);
+  if(Object.keys(r.sG).length)sp("G. INITIAL ESCROW",r.sG,r.tG);
+  divider();row("I. TOTAL OTHER COSTS (E+F+G)",fmt(r.tI2));
+  if(r.lc>0)row("Credit to Borrower","-"+fmt(r.lc));
+  row("J. TOTAL CLOSING COSTS",fmt(r.tJ),true);y+=4;
+  np();hdr("PRICING");row("OB Price",r.pricing.obPrice.toFixed(3));
+  row("Price Exception",(r.pricing.priceException>=0?"+":"")+r.pricing.priceException.toFixed(3));
+  row("Adjusted Price",r.pricing.adjusted.toFixed(3));
+  row(r.pricing.isCredit?"Credit to Borrower":"Discount Points",fmt(r.pricing.diffDollars));y+=4;
+  hdr("CASH TO CLOSE");row("Loan Amount",fmt(tab==="fha"?r.tl:r.totalLoan));
+  row("- Total Closing Costs (J)",fmt(-r.tJ));row("- Estimated Payoff",fmt(-r.payoff));divider();
+  row("Cash to Close ("+(r.ctc<=0?"From Borrower":"To Borrower")+")",fmt(Math.abs(r.ctc)),true);y+=4;
+  np();hdr("NEW PAYMENT");row("New Rate",fmtP(r.nr));row("Term",(r.term/12)+" years");
+  row("P&I",fmt(r.npi));if(tab==="fha")row("Monthly MIP",fmt(r.nm||0));
+  row("Escrow",fmt(r.esc));row("New Total Payment",fmt(r.newT),true);row("Current Total Payment",fmt(r.oldT));
+  divider();row("Monthly Savings",fmt(r.sav),true);row("Annual Savings",fmt(r.annual),true);
+  if(r.be)row("Break-Even",r.be+" months");y+=4;
+  hdr("COMPLIANCE");
+  if(tab==="fha"){row("NTB Rate Reduction",fmtP(r.rr)+" (need >= 0.500%)");row("NTB Payment Reduction",fmt(r.pr)+" (need >= $50)");row("NTB Result",r.ntbPass?"PASS":"FAIL");
+  if(r.seas)row("Seasoning (210d from closing)",r.seas.pass?"PASS "+r.seas.days+"d":"NOT YET "+r.seas.earliest);}
+  else{row("Rate Reduction",fmtP(r.rr)+" (need >= 0.500%)");row("NTB Result",r.ntbPass?"PASS":"FAIL");
+  row("Recoupment",(r.recM||"N/A")+" months (max 36)");row("Recoupment",r.recPass?"PASS":"FAIL");
+  if(r.seas)row("Seasoning (210d from 1st pmt due)",r.seas.pass?"PASS "+r.seas.days+"d":"NOT YET "+r.seas.earliest);}
+  y+=8;doc.setFontSize(6);doc.setTextColor(74,85,104);
+  doc.text("Subject to final underwriting approval. Rates and fees subject to change.",LM,y);y+=4;
+  doc.text("Team Lamm · MortgageOne Inc. NMLS #209221 · "+new Date().toLocaleString(),LM,y);
+  doc.save("Processing_"+(borrower||"Borrower").replace(/\s/g,"_")+"_"+new Date().toISOString().split("T")[0]+".pdf");
+}
+
+function generateEmail(r,tab,borrower,property){
+  const first=(borrower||"").split(" ")[0]||"there";
+  const lt=tab==="fha"?"FHA":"VA";
+  const L=[];
+  L.push("Subject: Your "+lt+" Refinance — "+(property||"Your Property"));L.push("");
+  L.push("Hi "+first+",");L.push("");
+  L.push("I've run the numbers on refinancing your "+lt+" loan and wanted to share what I'm seeing.");L.push("");
+  L.push("YOUR NEW LOAN");
+  L.push("  New Rate: "+fmtP(r.nr));
+  L.push("  New Payment: "+fmt(r.newT)+"/mo (P&I"+(tab==="fha"?" + MIP":"")+" + escrow)");
+  L.push("  Current Payment: "+fmt(r.oldT)+"/mo");
+  L.push("  Monthly Savings: "+fmt(r.sav));
+  L.push("  Annual Savings: "+fmt(r.annual));
+  L.push("  Estimated Cash to Close: "+fmt(Math.abs(r.ctc))+" "+(r.ctc<=0?"(from you)":"(to you)"));
+  if(r.be)L.push("  Break-Even: ~"+r.be+" months");L.push("");
+  if(r.skip&&r.skip.cnt>0||r.eRef){L.push("CASH BACK TO YOU");
+  if(r.skip&&r.skip.cnt>0)L.push("During the refinance process, you'll skip your "+r.skip.months.join(" and ")+" payment"+(r.skip.cnt>1?"s":"")+". That's "+fmt(r.skip.saved)+" you keep in your pocket. Your first new payment won't be due until "+r.skip.firstNew+".");
+  if(r.eRef)L.push("Your current lender will also refund your escrow balance — I estimate roughly "+fmt(r.eRef.refund)+". This typically arrives 20 to 30 days after closing.");L.push("");}
+  L.push("A FEW THINGS TO KEEP IN MIND");
+  L.push("• The payoff amount is estimated based on your most recent statement and includes a per-diem interest buffer through closing. The actual payoff will be confirmed by your current lender before we close.");
+  L.push("• Property insurance costs can change at renewal, which would affect your escrow and total monthly payment.");
+  if(r.eRef)L.push("• The escrow refund estimate is based on your current balance and may vary depending on tax and insurance disbursements between now and closing.");
+  L.push("• Property tax amounts are based on the most recent bill. If your assessed value changes, taxes may adjust accordingly.");
+  if(tab==="fha")L.push("• Your UFMIP refund of "+fmt(r.ref?.amt||0)+" has already been factored into these numbers, reducing your financed amount.");
+  if(tab==="va")L.push("• There is no monthly mortgage insurance on VA loans — that's a built-in benefit of your VA eligibility.");
+  L.push("");L.push("These are estimates based on current pricing and are subject to final underwriting approval. Rates and fees can change daily.");
+  L.push("");L.push("Want to talk through the numbers? Happy to jump on a quick call or answer questions.");
+  L.push("");L.push("Chris Lamm");L.push("Team Lamm · MortgageOne Inc.");L.push("NMLS #209221");
+  return L.join("\n");
+}
+
+const S={
+  page:{fontFamily:"'JetBrains Mono',monospace",background:"#0a0e17",color:"#c8cdd5",minHeight:"100vh",padding:"16px",maxWidth:"1200px",margin:"0 auto"},
+  h1:{fontSize:"15px",fontWeight:700,letterSpacing:"3px",color:"#50fa7b",textTransform:"uppercase",marginBottom:"4px"},
+  h2:{fontSize:"12px",fontWeight:400,color:"#6272a4",letterSpacing:"1px",marginBottom:"20px"},
+  tabs:{display:"flex",gap:"2px",marginBottom:"20px"},
+  tab:a=>({padding:"10px 24px",fontSize:"12px",fontWeight:600,letterSpacing:"1px",cursor:"pointer",border:"1px solid "+(a?"#50fa7b":"#2a3040"),background:a?"#14201a":"transparent",color:a?"#50fa7b":"#6272a4",textTransform:"uppercase"}),
+  card:{background:"#111827",border:"1px solid #1e293b",padding:"16px",marginBottom:"12px"},
+  ct:{fontSize:"11px",fontWeight:700,color:"#8be9fd",letterSpacing:"2px",textTransform:"uppercase",marginBottom:"12px",borderBottom:"1px solid #1e293b",paddingBottom:"8px"},
+  g:c=>({display:"grid",gridTemplateColumns:"repeat("+c+",1fr)",gap:"10px"}),
+  lb:{fontSize:"10px",color:"#6272a4",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:"3px",display:"block"},
+  inp:{width:"100%",padding:"8px 10px",background:"#0d1117",border:"1px solid #2a3040",color:"#e2e8f0",fontSize:"13px",fontFamily:"inherit",boxSizing:"border-box"},
+  sel:{width:"100%",padding:"8px 10px",background:"#0d1117",border:"1px solid #2a3040",color:"#e2e8f0",fontSize:"13px",fontFamily:"inherit",boxSizing:"border-box"},
+  btn:{padding:"12px 32px",background:"#50fa7b",color:"#0a0e17",border:"none",fontWeight:700,fontSize:"12px",cursor:"pointer",letterSpacing:"2px",textTransform:"uppercase",fontFamily:"inherit"},
+  btn2:c=>({padding:"10px 20px",background:"transparent",border:"1px solid "+c,color:c,fontWeight:600,fontSize:"11px",cursor:"pointer",letterSpacing:"1px",textTransform:"uppercase",fontFamily:"inherit"}),
+  sr:{display:"flex",justifyContent:"space-between",padding:"3px 0",fontSize:"12px"},
+  sl:{color:"#8b95a5"},sa:c=>({color:c||"#c8cdd5",fontWeight:500}),
+  m:c=>({background:"#0d1117",border:"1px solid "+(c||"#50fa7b")+"33",padding:"12px",textAlign:"center"}),
+  mv:c=>({fontSize:"20px",fontWeight:700,color:c||"#50fa7b",fontFamily:"inherit"}),
+  ml:{fontSize:"9px",color:"#6272a4",textTransform:"uppercase",letterSpacing:"1px",marginTop:"4px"},
+  badge:p=>({display:"inline-block",padding:"3px 10px",fontSize:"10px",fontWeight:700,letterSpacing:"1px",color:p?"#50fa7b":"#ff5555",border:"1px solid "+(p?"#50fa7b":"#ff5555"),textTransform:"uppercase"}),
+  info:c=>({background:(c||"#8be9fd")+"0a",border:"1px solid "+(c||"#8be9fd")+"33",padding:"12px",fontSize:"12px",color:c||"#8be9fd",marginBottom:"12px"}),
+  div:{borderTop:"1px solid #1e293b",margin:"8px 0"},
+};
+function In({label,value,onChange,type,placeholder,step,min}){
+  return React.createElement("div",null,React.createElement("label",{style:S.lb},label),React.createElement("input",{style:S.inp,type:type||"text",value:value,onChange:e=>onChange(e.target.value),placeholder:placeholder||"",step:step,min:min}));
+}
+function Sel2({label,value,onChange,options}){
+  return React.createElement("div",null,React.createElement("label",{style:S.lb},label),React.createElement("select",{style:S.sel,value:value,onChange:e=>onChange(e.target.value)},options.map(([v,l])=>React.createElement("option",{key:v,value:v},l))));
+}
+function Chk({label,checked,onChange}){
+  return React.createElement("label",{style:{display:"flex",alignItems:"center",gap:"8px",fontSize:"12px",color:"#c8cdd5",cursor:"pointer"}},React.createElement("input",{type:"checkbox",checked:checked,onChange:e=>onChange(e.target.checked)}),label);
+}
+function Met({v,l,c}){c=c||"#50fa7b";return React.createElement("div",{style:S.m(c)},React.createElement("div",{style:S.mv(c)},v),React.createElement("div",{style:S.ml},l));}
+function Sec({title,items,total}){
+  return React.createElement("div",{style:{marginBottom:"8px"}},
+    React.createElement("div",{style:{fontSize:"10px",fontWeight:700,color:"#8be9fd",letterSpacing:"1px",marginBottom:"4px"}},title),
+    Object.entries(items).map(([k,v])=>React.createElement("div",{key:k,style:S.sr},React.createElement("span",{style:S.sl},k),React.createElement("span",{style:S.sa()},fmt(v)))),
+    React.createElement("div",{style:{...S.sr,borderTop:"1px solid #1e293b",marginTop:"2px",paddingTop:"4px"}},React.createElement("span",{style:{color:"#e2e8f0",fontWeight:600,fontSize:"11px"}},"Subtotal"),React.createElement("span",{style:{color:"#e2e8f0",fontWeight:700}},fmt(total)))
+  );
+}
+
+function App(){
+  const[tab,setTab]=useState("fha");const[r,setR]=useState(null);
+  const[email,setEmail]=useState("");const[showEmail,setShowEmail]=useState(false);const[copied,setCopied]=useState(false);
+  const[borrower,setBorrower]=useState("");const[property,setProperty]=useState("");
+  const[county,setCounty]=useState("Shasta County, CA");const[lo,setLo]=useState("Chris Lamm");
+  const[bal,setBal]=useState("");const[rate,setRate]=useState("");const[pi,setPi]=useState("");
+  const[nr,setNr]=useState("");const[term,setTerm]=useState("360");
+  const[tax,setTax]=useState("");const[ins,setIns]=useState("");
+  const[obP,setObP]=useState("");const[pe,setPe]=useState("0");
+  const[eIM,setEIM]=useState("2");const[eTM,setETM]=useState("8");
+  const[pTM,setPTM]=useState("2");const[iPM,setIPM]=useState("6");
+  const[stDate,setStDate]=useState("");const[stBal,setStBal]=useState("");const[dtc,setDtc]=useState("30");
+  const[ocDate,setOcDate]=useState("");const[fpDate,setFpDate]=useState("");const[tcDate,setTcDate]=useState("");
+  const[eBal,setEBal]=useState("");const[eMo,setEMo]=useState("");
+  const[lastTax,setLastTax]=useState("second");
+  const[mip,setMip]=useState("");const[origU,setOrigU]=useState("");const[caseD,setCaseD]=useState("");
+  const[disEx,setDisEx]=useState(false);const[vPmts,setVPmts]=useState("");const[pts,setPts]=useState("0");
+  const handleOC=v=>{setOcDate(v);if(v){const d=new Date(v);const f=new Date(d.getFullYear(),d.getMonth()+2,1);setFpDate(f.toISOString().split("T")[0]);}};
+  const calc=useCallback(()=>{
+    const p=v=>parseFloat(v)||0;
+    const base={bal:p(bal),rate:p(rate)/100,pi:p(pi),nr:p(nr)/100,term:parseInt(term),tax:p(tax),ins:p(ins),obP:p(obP),pe:p(pe),eIM:parseInt(eIM),eTM:parseInt(eTM),pTM:p(pTM),iPM:p(iPM),useSt:!!stDate,stDate,stBal:p(stBal),dtc:parseInt(dtc),tcDate,ocDate,fpDate,eBal:p(eBal),eMo:p(eMo)};
+    if(tab==="fha")setR(runFHA({...base,mip:p(mip),origUfmip:p(origU),caseDate:caseD}));
+    else setR(runVA({...base,disEx,pmts:parseInt(vPmts)||0,pts:p(pts)}));
+    setShowEmail(false);setEmail("");setCopied(false);
+  },[tab,bal,rate,pi,nr,term,tax,ins,obP,pe,eIM,eTM,pTM,iPM,stDate,stBal,dtc,tcDate,ocDate,fpDate,eBal,eMo,mip,origU,caseD,disEx,vPmts,pts]);
+  const genEmail=()=>{setEmail(generateEmail(r,tab,borrower,property));setShowEmail(true);setCopied(false);};
+  const copyEmail=()=>{navigator.clipboard.writeText(email).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2000);});};
+
+  return <div style={S.page}>
+    <div style={S.h1}>Team Lamm Refi Calculator</div>
+    <div style={S.h2}>MortgageOne Inc. — NMLS #209221 · Internal Use Only · v2.1</div>
+    <div style={S.tabs}>
+      <div style={S.tab(tab==="fha")} onClick={()=>{setTab("fha");setR(null);setShowEmail(false);}}>FHA Streamline</div>
+      <div style={S.tab(tab==="va")} onClick={()=>{setTab("va");setR(null);setShowEmail(false);}}>VA IRRRL</div>
+    </div>
+
+    <div style={S.card}><div style={S.ct}>Borrower & Property</div>
+      <div style={S.g(4)}>
+        <In label="Borrower Name" value={borrower} onChange={setBorrower} placeholder="John & Jane Smith"/>
+        <In label="Property Address" value={property} onChange={setProperty} placeholder="123 Main St, Redding CA"/>
+        <In label="County, State" value={county} onChange={setCounty} placeholder="Shasta County, CA"/>
+        <In label="Loan Officer" value={lo} onChange={setLo} placeholder="Chris Lamm"/>
+      </div>
+    </div>
+
+    <div style={S.card}><div style={S.ct}>Current Loan & Statement</div>
+      <div style={S.g(4)}>
+        <In label="Current UPB" value={bal} onChange={setBal} placeholder="419000"/>
+        <In label="Current Rate (%)" value={rate} onChange={setRate} placeholder="7.000" step="0.125"/>
+        <In label="Current P&I" value={pi} onChange={setPi} placeholder="2788"/>
+        {tab==="fha"?<In label="Monthly MIP" value={mip} onChange={setMip} placeholder="192"/>:<In label="Payments Made (consecutive)" value={vPmts} onChange={setVPmts} placeholder="8"/>}
+      </div>
+      <div style={{...S.g(4),marginTop:"10px"}}>
+        <In label="Statement Date" value={stDate} onChange={setStDate} type="date"/>
+        <In label="Statement Balance" value={stBal} onChange={setStBal} placeholder="Same as UPB"/>
+        <In label="Current Escrow Balance" value={eBal} onChange={setEBal} placeholder="3200"/>
+        <In label="Monthly Escrow Payment" value={eMo} onChange={setEMo} placeholder="590"/>
+      </div>
+    </div>
+
+    <div style={S.card}><div style={S.ct}>Dates & Seasoning</div>
+      <div style={S.g(4)}>
+        <In label="Original Closing Date" value={ocDate} onChange={handleOC} type="date"/>
+        <In label="First Payment Due Date (auto)" value={fpDate} onChange={setFpDate} type="date"/>
+        <In label="Target Closing Date" value={tcDate} onChange={setTcDate} type="date"/>
+        {tab==="fha"?<In label="FHA Case Assignment Date" value={caseD} onChange={setCaseD} type="date"/>:<div style={{paddingTop:"12px"}}><Chk label="VA Disability Exempt (≥10%)" checked={disEx} onChange={setDisEx}/></div>}
+      </div>
+      {tab==="fha"&&ocDate&&tcDate&&(()=>{const s=fhaSeason(ocDate,fpDate,tcDate);if(!s)return null;return <div style={{...S.card,marginTop:"10px",border:s.pass?"1px solid #50fa7b33":"1px solid #ff555533"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"12px",marginBottom:"8px"}}><span style={S.badge(s.pass)}>{s.pass?"✓ ELIGIBLE":"✗ NOT YET"}</span>{!s.pass&&<span style={{fontSize:"11px",color:"#f1fa8c"}}>Earliest: {s.earliest}</span>}</div>
+        <div style={S.g(3)}>
+          <div><div style={{fontSize:"10px",color:"#6272a4"}}>Days from Closing Date</div><div style={{fontSize:"14px",color:s.daysPass?"#50fa7b":"#ff5555",fontWeight:600}}>{s.days} / 210</div></div>
+          <div><div style={{fontSize:"10px",color:"#6272a4"}}>Months from 1st Payment</div><div style={{fontSize:"14px",color:s.mosPass?"#50fa7b":"#ff5555",fontWeight:600}}>{s.mos} / 6</div></div>
+          <div><div style={{fontSize:"10px",color:"#6272a4"}}>Payments Made</div><div style={{fontSize:"14px",color:s.pmtsPass?"#50fa7b":"#ff5555",fontWeight:600}}>{s.pmts} / 6</div></div>
+        </div>
+        <div style={{fontSize:"9px",color:"#6272a4",marginTop:"6px"}}>FHA: 210 days from original closing date + 6 payments made</div>
+      </div>;})()}
+      {tab==="va"&&fpDate&&tcDate&&(()=>{const s=vaSeason(fpDate,tcDate,parseInt(vPmts)||0);if(!s)return null;return <div style={{...S.card,marginTop:"10px",border:s.pass?"1px solid #50fa7b33":"1px solid #ff555533"}}>
+        <div style={{display:"flex",alignItems:"center",gap:"12px",marginBottom:"8px"}}><span style={S.badge(s.pass)}>{s.pass?"✓ ELIGIBLE":"✗ NOT YET"}</span>{!s.pass&&<span style={{fontSize:"11px",color:"#f1fa8c"}}>Earliest: {s.earliest}</span>}</div>
+        <div style={S.g(2)}>
+          <div><div style={{fontSize:"10px",color:"#6272a4"}}>Days from 1st Payment Due Date</div><div style={{fontSize:"14px",color:s.daysPass?"#50fa7b":"#ff5555",fontWeight:600}}>{s.days} / 210</div></div>
+          <div><div style={{fontSize:"10px",color:"#6272a4"}}>Consecutive Payments Made</div><div style={{fontSize:"14px",color:s.pmtsPass?"#50fa7b":"#ff5555",fontWeight:600}}>{s.pmts} / 6</div></div>
+        </div>
+        <div style={{fontSize:"9px",color:"#6272a4",marginTop:"6px"}}>VA IRRRL (PL 116-33): 210 days from first payment due date + 6 consecutive payments</div>
+      </div>;})()}
+    </div>
+
+    {tab==="fha"&&<div style={S.card}><div style={S.ct}>FHA UFMIP</div><div style={S.g(2)}>
+      <In label="Original UFMIP Amount" value={origU} onChange={setOrigU} placeholder="7300"/>
+      <div style={{fontSize:"11px",color:"#6272a4",paddingTop:"18px"}}>M1=80% · M6=70% · M12=58% · M24=34% · M30=22% · M36=10%</div>
+    </div></div>}
+
+    <div style={S.card}><div style={S.ct}>New Loan & Pricing</div>
+      <div style={S.g(4)}>
+        <In label="New Rate (%)" value={nr} onChange={setNr} placeholder="5.750" step="0.125"/>
+        <Sel2 label="Term" value={term} onChange={setTerm} options={[["360","30 Year"],["240","20 Year"],["180","15 Year"]]}/>
+        <In label="OB Price" value={obP} onChange={setObP} placeholder="101.750"/>
+        <In label="Price Exception (+/-)" value={pe} onChange={setPe} placeholder="0"/>
+      </div>
+      <div style={S.info("#f1fa8c")}>Adjusted Price = OB Price + Exception. Above 100 = Credit to Borrower (reduces costs). Below 100 = Discount Points (added to Section A).</div>
+      {tab==="va"&&<In label="Discount Points (%)" value={pts} onChange={setPts} placeholder="0"/>}
+    </div>
+
+    <div style={S.card}><div style={S.ct}>{"Property Taxes & Insurance — "+(county||"County TBD")}</div>
+      <div style={S.g(4)}>
+        <In label="Annual Property Taxes" value={tax} onChange={setTax} placeholder="4854"/>
+        <In label="Annual Insurance" value={ins} onChange={setIns} placeholder="2237"/>
+        <Sel2 label="Last Tax Installment Paid" value={lastTax} onChange={setLastTax} options={[["second","2nd (Feb — Jan-Jun)"],["first","1st (Nov — Jul-Dec)"],["none","Unknown"]]}/>
+        <In label="Insurance Prepaid (months)" value={iPM} onChange={setIPM} placeholder="6"/>
+      </div>
+      <div style={{...S.g(3),marginTop:"10px"}}>
+        <In label="Escrow Insurance Reserve (mo)" value={eIM} onChange={setEIM} placeholder="2"/>
+        <In label="Escrow Tax Reserve (mo)" value={eTM} onChange={setETM} placeholder="8"/>
+        <In label="Prepaid Tax (mo)" value={pTM} onChange={setPTM} placeholder="2"/>
+      </div>
+      <div style={S.info()}>CA Tax: 1st due Nov 1 (Jul-Dec, delinquent Dec 10) · 2nd due Feb 1 (Jan-Jun, delinquent Apr 10)</div>
+    </div>
+
+    <div style={{textAlign:"center",marginBottom:"20px"}}><button style={S.btn} onClick={calc}>Calculate</button></div>
+
+    {r&&<div>
+      <div style={{display:"flex",gap:"10px",marginBottom:"16px"}}>
+        <button style={S.btn2("#ff79c6")} onClick={()=>generatePDF(r,tab,borrower,property,lo)}>📄 Download Processing PDF</button>
+        <button style={S.btn2("#8be9fd")} onClick={genEmail}>✉️ Generate Client Email</button>
+      </div>
+
+      <div style={S.g(6)}>
+        <Met v={fmt(r.payoff)} l="Est. Payoff" c="#ff79c6"/>
+        <Met v={fmt(tab==="fha"?r.tl:r.totalLoan)} l="Total Loan" c="#8be9fd"/>
+        <Met v={fmtP(r.nr)} l="New Rate" c="#f8f8f2"/>
+        <Met v={fmt(r.npi)} l="New P&I" c="#f8f8f2"/>
+        <Met v={fmt(r.sav)} l="Mo. Savings" c={r.sav>0?"#50fa7b":"#ff5555"}/>
+        <Met v={r.be?r.be+" mo":"N/A"} l="Break-Even" c="#f1fa8c"/>
+      </div>
+
+      <div style={{...S.card,marginTop:"12px"}}><div style={S.ct}>Payoff Estimation (20-Day Buffer)</div>
+        <div style={S.sr}><span style={S.sl}>Statement Balance</span><span style={S.sa()}>{fmt(parseFloat(stBal||bal))}</span></div>
+        <div style={S.sr}><span style={S.sl}>Per Diem</span><span style={S.sa()}>{fmtC(r.po?.pd||0)}/day</span></div>
+        <div style={S.sr}><span style={S.sl}>Days (statement → closing + 20-day buffer)</span><span style={S.sa()}>{r.po?.days||0}</span></div>
+        <div style={S.div}/><div style={S.sr}><span style={{color:"#e2e8f0",fontWeight:700}}>Estimated Payoff</span><span style={{color:"#ff79c6",fontWeight:700,fontSize:"14px"}}>{fmt(r.payoff)}</span></div>
+      </div>
+
+      {tab==="fha"&&r.u&&<div style={S.card}><div style={S.ct}>UFMIP</div>
+        <div style={S.sr}><span style={S.sl}>Months since case</span><span style={S.sa()}>{r.ref.ms}</span></div>
+        <div style={S.sr}><span style={S.sl}>Refund rate</span><span style={S.sa(r.ref.p>0?"#50fa7b":"#ff5555")}>{r.ref.pDisp}</span></div>
+        <div style={S.sr}><span style={S.sl}>Refund amount</span><span style={S.sa("#50fa7b")}>{fmt(r.ref.amt)}</span></div>
+        <div style={S.div}/>
+        <div style={S.sr}><span style={S.sl}>Gross UFMIP (1.75%)</span><span style={S.sa()}>{fmt(r.u.g)}</span></div>
+        <div style={S.sr}><span style={S.sl}>Net UFMIP Financed</span><span style={S.sa()}>{fmt(r.u.n)}</span></div>
+        <div style={S.sr}><span style={{color:"#8be9fd",fontWeight:700}}>Total Loan</span><span style={{color:"#8be9fd",fontWeight:700}}>{fmt(r.tl)}</span></div>
+      </div>}
+
+      {tab==="va"&&r.va&&<div style={S.card}><div style={S.ct}>VA Form 26-8923 — Max Loan</div>
+        <div style={S.sr}><span style={S.sl}>Existing Balance (Payoff)</span><span style={S.sa()}>{fmt(r.va.bal)}</span></div>
+        <div style={S.sr}><span style={S.sl}>Closing Costs (excl FF)</span><span style={S.sa()}>{fmt(r.va.costs)}</span></div>
+        <div style={S.sr}><span style={S.sl}>Preliminary Loan (Line 9)</span><span style={S.sa()}>{fmt(r.va.prelim)}</span></div>
+        <div style={S.div}/>
+        <div style={S.sr}><span style={S.sl}>Revised FF</span><span style={S.sa()}>{fmt(r.va.revFF)}</span></div>
+        <div style={S.sr}><span style={{color:"#8be9fd",fontWeight:700}}>Max Loan (Line 18)</span><span style={{color:"#8be9fd",fontWeight:700,fontSize:"14px"}}>{fmt(r.totalLoan)}</span></div>
+        <div style={S.sr}><span style={S.sl}>Funding Fee ({r.disEx?"EXEMPT":"0.50%"})</span><span style={S.sa(r.disEx?"#50fa7b":"#f8f8f2")}>{fmt(r.ffAmt)}</span></div>
+      </div>}
+
+      <div style={S.card}><div style={S.ct}>Closing Costs — LE Sections A–J</div>
+        <Sec title="A. Origination Charges" items={r.sA} total={r.tA}/>
+        <Sec title="B. Services Cannot Shop For" items={r.sB} total={r.tB}/>
+        <Sec title="C. Services Can Shop For" items={r.sC} total={r.tC}/>
+        <div style={{...S.sr,background:"#1e293b22",padding:"6px 4px",fontWeight:700,margin:"4px 0"}}><span style={{color:"#8be9fd"}}>D. TOTAL LOAN COSTS</span><span style={{color:"#8be9fd"}}>{fmt(r.tD)}</span></div>
+        <Sec title="E. Government Fees" items={r.sE} total={r.tE}/>
+        {Object.keys(r.sF).length>0&&<Sec title="F. Prepaids" items={r.sF} total={r.tF}/>}
+        {Object.keys(r.sG).length>0&&<Sec title="G. Initial Escrow" items={r.sG} total={r.tG}/>}
+        <div style={{...S.sr,background:"#1e293b22",padding:"6px 4px",margin:"4px 0"}}><span style={{color:"#6272a4",fontWeight:600}}>I. TOTAL OTHER COSTS</span><span style={{fontWeight:600}}>{fmt(r.tI2)}</span></div>
+        {r.lc>0&&<div style={{...S.sr,padding:"4px 4px"}}><span style={{color:"#50fa7b",fontWeight:600}}>Credit to Borrower</span><span style={{color:"#50fa7b",fontWeight:600}}>-{fmt(r.lc)}</span></div>}
+        <div style={{...S.sr,background:"#50fa7b11",padding:"8px 4px",fontWeight:700,margin:"4px 0",fontSize:"13px"}}><span style={{color:"#50fa7b"}}>J. TOTAL CLOSING COSTS (D+I−Credits)</span><span style={{color:"#50fa7b"}}>{fmt(r.tJ)}</span></div>
+      </div>
+
+      <div style={S.card}><div style={S.ct}>Pricing</div>
+        <div style={S.sr}><span style={S.sl}>OB Price</span><span style={S.sa()}>{r.pricing.obPrice.toFixed(3)}</span></div>
+        <div style={S.sr}><span style={S.sl}>Price Exception</span><span style={S.sa(r.pricing.priceException>=0?"#50fa7b":"#ff5555")}>{r.pricing.priceException>=0?"+":""}{r.pricing.priceException.toFixed(3)}</span></div>
+        <div style={S.sr}><span style={S.sl}>Adjusted Price</span><span style={S.sa()}>{r.pricing.adjusted.toFixed(3)}</span></div>
+        <div style={S.div}/>
+        <div style={S.sr}><span style={{color:r.pricing.isCredit?"#50fa7b":"#ff5555",fontWeight:700}}>{r.pricing.isCredit?"Credit to Borrower":"Discount Points"}</span><span style={{color:r.pricing.isCredit?"#50fa7b":"#ff5555",fontWeight:700,fontSize:"14px"}}>{fmt(r.pricing.diffDollars)}</span></div>
+        {r.pricing.isCredit&&<div style={{fontSize:"10px",color:"#50fa7b",marginTop:"4px"}}>↑ Applied as credit reducing closing costs in Section J and cash to close</div>}
+        {!r.pricing.isCredit&&r.pricing.diffDollars>0&&<div style={{fontSize:"10px",color:"#ff5555",marginTop:"4px"}}>↑ Added as cost in Section A: Origination Charges</div>}
+      </div>
+
+      <div style={S.card}><div style={S.ct}>Cash to Close</div>
+        <div style={S.sr}><span style={S.sl}>Loan Amount</span><span style={S.sa()}>{fmt(tab==="fha"?r.tl:r.totalLoan)}</span></div>
+        <div style={S.sr}><span style={S.sl}>− Closing Costs (J, net of credits)</span><span style={S.sa("#ff5555")}>{fmt(-r.tJ)}</span></div>
+        <div style={S.sr}><span style={S.sl}>− Estimated Payoff</span><span style={S.sa("#ff5555")}>{fmt(-r.payoff)}</span></div>
+        <div style={S.div}/>
+        <div style={S.sr}><span style={{fontWeight:700,color:"#f8f8f2"}}>Cash to Close ({r.ctc<=0?"From Borrower":"To Borrower"})</span><span style={{color:r.ctc>0?"#50fa7b":"#ff79c6",fontWeight:700,fontSize:"16px"}}>{fmt(Math.abs(r.ctc))}</span></div>
+      </div>
+
+      {(r.skip?.cnt>0||r.eRef)&&<div style={S.card}><div style={S.ct}>💰 Cash Back to Borrower</div>
+        {r.skip?.cnt>0&&<div style={{marginBottom:"10px"}}>
+          <div style={S.sr}><span style={S.sl}>Skipped: {r.skip.months.join(", ")}</span><span style={S.sa("#50fa7b")}>{fmt(r.skip.saved)}</span></div>
+          <div style={{fontSize:"10px",color:"#6272a4"}}>First new payment: {r.skip.firstNew}</div>
+        </div>}
+        {r.eRef&&<div style={{marginBottom:"10px"}}>
+          <div style={S.sr}><span style={S.sl}>Est. Escrow Refund (20-30 days post-close)</span><span style={S.sa("#50fa7b")}>{fmt(r.eRef.refund)}</span></div>
+          <div style={{fontSize:"10px",color:"#6272a4"}}>Current balance: {fmt(r.eRef.bal)} + {r.eRef.mos} mo deposits</div>
+        </div>}
+        <div style={S.div}/>
+        <div style={S.sr}><span style={{color:"#50fa7b",fontWeight:700}}>Total Est. Cash Back</span><span style={{color:"#50fa7b",fontWeight:700,fontSize:"16px"}}>{fmt((r.skip?.saved||0)+(r.eRef?.refund||0))}</span></div>
+      </div>}
+
+      <div style={S.card}><div style={S.ct}>Payment Comparison</div>
+        <div style={S.g(2)}>
+          <div>
+            <div style={{fontSize:"10px",color:"#6272a4",marginBottom:"4px"}}>CURRENT</div>
+            <div style={S.sr}><span style={S.sl}>P&I</span><span style={S.sa()}>{fmt(parseFloat(pi))}</span></div>
+            {tab==="fha"&&<div style={S.sr}><span style={S.sl}>MIP</span><span style={S.sa()}>{fmt(parseFloat(mip))}</span></div>}
+            <div style={S.sr}><span style={S.sl}>Escrow</span><span style={S.sa()}>{fmt(r.esc)}</span></div>
+            <div style={{...S.sr,borderTop:"1px solid #2a3040",paddingTop:"4px"}}><span style={{fontWeight:700,color:"#e2e8f0"}}>Total</span><span style={{fontWeight:700,color:"#e2e8f0"}}>{fmt(r.oldT)}</span></div>
+          </div>
+          <div>
+            <div style={{fontSize:"10px",color:"#50fa7b",marginBottom:"4px"}}>NEW</div>
+            <div style={S.sr}><span style={S.sl}>P&I</span><span style={S.sa("#50fa7b")}>{fmt(r.npi)}</span></div>
+            {tab==="fha"&&<div style={S.sr}><span style={S.sl}>MIP</span><span style={S.sa("#50fa7b")}>{fmt(r.nm||0)}</span></div>}
+            <div style={S.sr}><span style={S.sl}>Escrow</span><span style={S.sa("#50fa7b")}>{fmt(r.esc)}</span></div>
+            <div style={{...S.sr,borderTop:"1px solid #2a3040",paddingTop:"4px"}}><span style={{fontWeight:700,color:"#50fa7b"}}>Total</span><span style={{fontWeight:700,color:"#50fa7b"}}>{fmt(r.newT)}</span></div>
+          </div>
+        </div>
+        <div style={{...S.m("#50fa7b"),marginTop:"10px"}}><div style={S.mv("#50fa7b")}>{fmt(r.sav)}/mo · {fmt(r.annual)}/yr</div><div style={S.ml}>Monthly & Annual Savings</div></div>
+      </div>
+
+      <div style={S.card}><div style={S.ct}>Compliance</div>
+        <div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"8px"}}>
+          <span style={S.badge(r.ntbPass)}>{r.ntbPass?"✓ NTB PASS":"✗ NTB FAIL"}</span>
+          <span style={{fontSize:"11px",color:"#8b95a5"}}>{tab==="fha"?"Rate: "+fmtP(r.rr)+" (≥0.500%) · Payment: "+fmt(r.pr)+" (≥$50)":"Rate: "+fmtP(r.rr)+" (≥0.500%)"}</span>
+        </div>
+        {r.seas&&<div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"8px"}}>
+          <span style={S.badge(r.seas.pass)}>{r.seas.pass?"✓ SEASONING":"✗ SEASONING"}</span>
+          <span style={{fontSize:"11px",color:"#8b95a5"}}>{r.seas.pass?"Eligible":"Earliest: "+r.seas.earliest} — {tab==="fha"?"210 days from closing":"210 days from 1st pmt due (PL 116-33)"}</span>
+        </div>}
+        {tab==="va"&&<div style={{display:"flex",alignItems:"center",gap:"10px",marginBottom:"8px"}}>
+          <span style={S.badge(r.recPass)}>{r.recPass?"✓ RECOUP":"✗ RECOUP"}</span>
+          <span style={{fontSize:"11px",color:"#8b95a5"}}>{r.recM?r.recM+" months (max 36)":"No savings"}</span>
+        </div>}
+      </div>
+
+      {showEmail&&<div style={S.card}><div style={S.ct}>Client Email</div>
+        <div style={{display:"flex",gap:"10px",marginBottom:"12px"}}>
+          <button style={S.btn2("#50fa7b")} onClick={copyEmail}>{copied?"✓ Copied!":"Copy to Clipboard"}</button>
+          <button style={S.btn2("#8be9fd")} onClick={()=>{window.open("mailto:?subject="+encodeURIComponent(email.split("\n")[0].replace("Subject: ",""))+"&body="+encodeURIComponent(email.split("\n").slice(2).join("\n")))}}>Open in Mail</button>
+        </div>
+        <textarea value={email} onChange={e=>setEmail(e.target.value)} style={{width:"100%",height:"400px",background:"#0d1117",border:"1px solid #2a3040",color:"#e2e8f0",fontSize:"12px",fontFamily:"inherit",padding:"12px",resize:"vertical"}}/>
+      </div>}
+
+      <div style={{...S.card,opacity:.6}}><div style={S.ct}>Fee Schedule</div>
+        <div style={{fontSize:"11px",color:"#6272a4",display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"4px"}}>
+          <span>Processing: $499</span><span>Underwriting: $499</span><span>Credit Report: $277</span>
+          <span>Flood: $5</span><span>Tax Svc: $65</span><span>Recording: $375</span>
+          <span>Appraisal: $750 (not streamline)</span><span>Title: Dynamic by loan amt</span>
+        </div>
+      </div>
+      <div style={{textAlign:"center",fontSize:"10px",color:"#4a5568",padding:"20px 0"}}>
+        Subject to final underwriting approval. Rates and fees subject to change.<br/>Team Lamm · MortgageOne Inc. NMLS #209221
+      </div>
+    </div>}
+  </div>;
+}
+ReactDOM.render(React.createElement(App),document.getElementById("root"));
+</script>
+</body>
+</html>
